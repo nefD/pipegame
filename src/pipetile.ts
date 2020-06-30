@@ -56,6 +56,8 @@ export default class PipeTile extends Phaser.GameObjects.Sprite {
   }
 
   onConnectionsUpdated() {
+    this.setAlpha(1);
+
     const count = this.getConnectionCount();
     if (count === 4) {
       this.setTexture(S_PIPE.cross);

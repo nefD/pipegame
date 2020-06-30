@@ -2,13 +2,9 @@ import Phaser from 'phaser';
 import PipeTile, { connectionsFactory } from '~/pipetile';
 import {
   Direction,
-  S_PIPE,
   TILE_HEIGHT,
 } from '~/data';
-import {
-  shuffleArray,
-  uniqueArray,
-} from '~/utils';
+import { uniqueArray } from '~/utils';
 import {
   GAME_HEIGHT,
   GAME_WIDTH,
@@ -22,6 +18,9 @@ const pathTileFactory = (tile: PipeTile, connections: Direction[] = []) => ({ ti
 
 export default class Board {
 
+  public debugCoords = false;
+  public debugPaths = false;
+
   public scene: Phaser.Scene;
   public tiles: Array<PipeTile[]> = [];
   public height: number = 0;
@@ -33,6 +32,8 @@ export default class Board {
   public poweredTiles: PipeTile[] = [];
   public emitter = new Phaser.Events.EventEmitter();
   public container: Phaser.GameObjects.Container;
+  public rt?: Phaser.GameObjects.RenderTexture;
+  public slimePoints: Phaser.Math.Vector2[] = [];
 
   constructor(scene: Phaser.Scene, x: number = 0, y: number = 0) {
     this.scene = scene;
@@ -66,8 +67,6 @@ export default class Board {
     let offsetX = -((perTile * this.width) / 2) + (perTile / 2);
     let offsetY = -((perTile * this.height) / 2) + (perTile / 2);
 
-
-
     this.tiles = [];
     for (let column = 0; column < this.width; column++) {
       this.tiles[column] = [];
@@ -76,6 +75,8 @@ export default class Board {
         this.scene.add.existing(o);
         this.container.add(o);
 
+        o.setAlpha(0);
+
         o.setPipeline('Light2D');
         o.setScale(targetScale);
         this.tiles[column][row] = o;
@@ -83,6 +84,14 @@ export default class Board {
 
         o.on('clicked', this.onTileClicked, this);
         this.emitter.on('updatePoweredStatus', o.onUpdatePoweredStatus, o);
+
+        if (this.debugCoords) {
+          let t = this.scene.add.text(o.x, o.y, ``);
+          this.container.add(t);
+          t.setOrigin(0.5, 0.5);
+          t.setFontSize(10);
+          t.setText(`${column},${row}`);
+        }
       }
     }
   }
@@ -114,10 +123,15 @@ export default class Board {
       }
     }
 
+    const targetEndPoints = Math.floor((this.width * this.height) / 30);
     let tries = 0;
-    while (tries < 20 && this.endTiles.length < 4) {
+    while (tries < 50 && this.endTiles.length < targetEndPoints) {
       tries += 1;
       this.createEndPath();
+    }
+
+    if (this.debugPaths) {
+      return;
     }
 
     this.fillRemainingBoard();
@@ -130,9 +144,16 @@ export default class Board {
       return;
     }
 
-    const maxAttempts = 50;
+    const maxAttempts = this.width * this.height;
+
+    // for 10x10
+    // const minimumLength = 10;
+    // const minimumDistance = 4;
+
+    // for 15x15
     const minimumLength = 10;
-    const minimumDistance = 4;
+    const minimumDistance = Math.max(2, Math.floor(this.width / 2) - Math.floor(this.endTiles.length / 2));
+
     const path: PathTile[] = [];
     let possibleDirections: Direction[] = [];
     let currentTile: PathTile;
@@ -154,6 +175,11 @@ export default class Board {
     const isEligible = (tile: PathTile, direction: Direction) => {
       const tileConnections = uniqueArray(tile.tile.getOpenConnections().concat(tile.connections));
       if (tileConnections.length >= 3 && !tileConnections.includes(direction)) {
+
+        if (this.debugPaths && this.endTiles.length > 2) {
+          console.log(`tile at ${tile.tile.boardX},${tile.tile.boardY}, direction ${direction} ineligible, tileConnections:`, tileConnections);
+        }
+
         return false;
       }
       let x, y;
@@ -167,10 +193,23 @@ export default class Board {
         tile.tile.boardX + x < 0 || tile.tile.boardX + x >= this.width ||
         tile.tile.boardY + y < 0 || tile.tile.boardY + y >= this.height
       ) {
+        if (this.debugPaths && this.endTiles.length > 2) {
+          console.log(`tile at ${tile.tile.boardX},${tile.tile.boardY}, out of bounds: ${tile.tile.boardX + x},${tile.tile.boardY + y}`);
+        }
+
         return false;
       }
 
       const checkTile = this.tiles[tile.tile.boardX + x][tile.tile.boardY + y];
+
+      if (this.debugPaths && this.endTiles.length > 2) {
+        console.log(`checking tile at ${checkTile.boardX},${checkTile.boardY},
+        connection count: ${checkTile.getConnectionCount()},
+        opposite open for ${direction}: ${checkTile.oppositeDirectionIsOpen(direction)},
+        exists in path: ${path.some(t => t.tile === checkTile)},
+        exists in endTiles: ${this.endTiles.includes(checkTile)}`);
+      }
+
       return checkTile != this.startTile
         && (checkTile.getConnectionCount() < 3 || checkTile.oppositeDirectionIsOpen(direction))
         && !path.some(t => t.tile === checkTile)
@@ -178,37 +217,77 @@ export default class Board {
     };
 
     const weightPossibleDirections = (tile: PathTile, possibleDirections: Direction[]) => {
-      this.endTiles.forEach(endTile => {
-        // TODO - only weight the direction with the most bias
-        let dirs: Record<Direction, number> = {
-          [Direction.north]: 0,
-          [Direction.east]: 0,
-          [Direction.south]: 0,
-          [Direction.west]: 0,
-        };
+      // TODO - only weight the direction with the most bias
+      let dirs: Record<Direction, number> = {
+        [Direction.north]: 0,
+        [Direction.east]: 0,
+        [Direction.south]: 0,
+        [Direction.west]: 0,
+      };
 
+      let newPoss: Direction[] = [];
+
+      this.endTiles.forEach(endTile => {
         const xCenterDist = endTile.boardX - Math.round(this.width / 2);
         const yCenterDist = endTile.boardY - Math.round(this.height / 2);
-        if (xCenterDist < 0 && possibleDirections.includes(Direction.west)) {
-          possibleDirections.push(Direction.west);
-          // dirs[Direction.west] += 1;
-        } else if (possibleDirections.includes(Direction.east)) {
-          possibleDirections.push(Direction.east);
+        if (xCenterDist < 0 && possibleDirections.includes(Direction.east)) {
+          // possibleDirections.push(Direction.east);
+          newPoss.push(Direction.east);
           // dirs[Direction.east] += 1;
+          // dirs[Direction.east] += Math.abs(xCenterDist);
+        } else if (xCenterDist > 0 && possibleDirections.includes(Direction.west)) {
+          // possibleDirections.push(Direction.west);
+          newPoss.push(Direction.west);
+          // dirs[Direction.west] += 1;
+          // dirs[Direction.west] += Math.abs(xCenterDist);
         }
         if (yCenterDist < 0 && possibleDirections.includes(Direction.south)) {
-          possibleDirections.push(Direction.south);
+          // possibleDirections.push(Direction.south);
+          newPoss.push(Direction.south);
           // dirs[Direction.south] += 1;
-        } else if (possibleDirections.includes(Direction.north)) {
-          possibleDirections.push(Direction.north);
+          // dirs[Direction.south] += Math.abs(yCenterDist);
+        } else if (yCenterDist > 0 && possibleDirections.includes(Direction.north)) {
+          // possibleDirections.push(Direction.north);
+          newPoss.push(Direction.north);
           // dirs[Direction.north] += 1;
+          // dirs[Direction.north] += Math.abs((yCenterDist));
         }
       });
+
+      if (this.debugPaths && this.endTiles.length > 2) {
+        console.log(`x: ${currentTile.tile.boardX}, y: ${currentTile.tile.boardY}, possibleDirections, new possible directions:`, possibleDirections, newPoss);
+      }
+
+      // prefer directions without existing connections
+      const withoutConns: Direction[] = [];
+      newPoss.forEach(d => {
+        switch (d) {
+          case Direction.north: if (this.tiles[tile.tile.boardX][tile.tile.boardY - 1].getConnectionCount() === 0) withoutConns.push(Direction.north); break;
+          case Direction.east: if (this.tiles[tile.tile.boardX + 1][tile.tile.boardY].getConnectionCount() === 0) withoutConns.push(Direction.east); break;
+          case Direction.south: if (this.tiles[tile.tile.boardX][tile.tile.boardY + 1].getConnectionCount() === 0) withoutConns.push(Direction.south); break;
+          case Direction.west: if (this.tiles[tile.tile.boardX - 1][tile.tile.boardY].getConnectionCount() === 0) withoutConns.push(Direction.west); break;
+        }
+      });
+      if (withoutConns.length > 0) {
+        return withoutConns;
+      }
+      newPoss = newPoss.concat(withoutConns);
+
+      if (this.debugPaths && this.endTiles.length > 2) {
+        console.log(`after preferring tiles with no connections:`, newPoss);
+      }
+
+      return newPoss.length ? newPoss : possibleDirections;
     };
 
     let success = false;
     let attempt = 0;
     for (attempt = 0; attempt < maxAttempts; attempt++) {
+
+      if (this.debugPaths && this.endTiles.length > 2) {
+        console.log(`******** currentTile is ${currentTile.tile.boardX},${currentTile.tile.boardY}`);
+      }
+
       possibleDirections = [];
       if (isEligible(currentTile, Direction.north)) {
         possibleDirections.push(Direction.north);
@@ -226,12 +305,29 @@ export default class Board {
       // @TODO - Favor going in new directions rather than reusing existing ones
 
       if (possibleDirections.length === 0) {
+        if (this.debugPaths && this.endTiles.length > 2) {
+          console.log(`failed to create end path, length is ${path.length}, no possible directions at ${currentTile.tile.boardX},${currentTile.tile.boardY}!`);
+          currentTile.tile.setTint(0xff0000);
+        }
+
         return;
       }
 
-      weightPossibleDirections(currentTile, possibleDirections);
-      shuffleArray(possibleDirections);
-      nextDirection = possibleDirections[0];
+      possibleDirections = weightPossibleDirections(currentTile, possibleDirections);
+      if (this.debugPaths && this.endTiles.length > 2) {
+        console.log(`after weighting:`, possibleDirections);
+      }
+
+      // shuffleArray(possibleDirections);
+      // if (this.endTiles.length > 2) {
+      //   console.log(`after weighting and shuffling:`, possibleDirections);
+      // }
+      // nextDirection = possibleDirections[0];
+      nextDirection = Phaser.Math.RND.pick(possibleDirections);
+      if (this.debugPaths && this.endTiles.length > 2) {
+        console.log(`randomly picked direction: ${nextDirection}`);
+      }
+
       switch (nextDirection) {
         case Direction.north:
           // TODO - write a helper function for this
@@ -251,6 +347,10 @@ export default class Board {
       path.push(nextTile);
       currentTile = nextTile;
 
+      if (this.debugPaths && this.endTiles.length > 2) {
+        debugger;
+      }
+
       if (path.length >= minimumLength) {
         const openConnections = currentTile.tile.getOpenConnections().length + currentTile.connections.length;
         const isMinimum = this.isMinimumDistance(currentTile.tile, minimumDistance);
@@ -258,7 +358,7 @@ export default class Board {
           currentTile.tile.boardY > 0 &&
           currentTile.tile.boardX < this.width - 1 &&
           currentTile.tile.boardY < this.height - 1;
-        if (openConnections === 1 && isMinimum && notEdge) {
+        if (openConnections === 1 && isMinimum && Phaser.Math.RND.integerInRange(0,1) === 0) { // && notEdge) {
           success = true;
           break;
         }
@@ -271,6 +371,10 @@ export default class Board {
 
     this.endTiles.push(currentTile.tile);
     path.forEach(t => t.tile.openConnections(t.connections));
+
+    // if (this.endTiles.length === 4) {
+    //   path.forEach(t => t.tile.setTint(0xff0000));
+    // }
   }
 
   private isMinimumDistance = (tile: PipeTile, minimumDistance: number, debug = false) => {
@@ -383,10 +487,11 @@ export default class Board {
     }
 
     let changed = 0;
+    const changeDelay = 17;
     this.poweredTiles.forEach((t, i) => {
       if (!checked.includes(t)) {
         if (t.powered) changed++;
-        t.setPowered(false, changed * 15);
+        t.setPowered(false, changed * changeDelay);
       }
     });
 
@@ -398,10 +503,9 @@ export default class Board {
       t.setPowered(true, changed * 15)
     });
 
+    this.determineSlimeDropPoints();
     this.checkForVictoryCondition();
   }
-
-  public rt?: Phaser.GameObjects.RenderTexture;
 
   public debugFlag = false;
   public checkForVictoryCondition() {
@@ -414,7 +518,7 @@ export default class Board {
     }
 
     let count = 0;
-    let countDelay = 8;
+    let countDelay = 5;
     let tile;
     for (let column = 0; column < this.width; column++) {
       for (let row = 0; row < this.height; row++) {
@@ -487,5 +591,42 @@ export default class Board {
 
     this.initBoard();
     this.generateBoard();
+  }
+
+  public determineSlimeDropPoints() {
+    // find all powered tiles with unreturned east, south, or west connections
+    let checkTile: PipeTile | null;
+    this.slimePoints = [];
+    this.poweredTiles.forEach(t => {
+      const open = t.getOpenConnections();
+      if (open.includes(Direction.west)) {
+        checkTile = this.getTileInDir(t, Direction.west);
+        if (!checkTile?.directionIsOpen(Direction.east)) {
+          const v = new Phaser.Math.Vector2(t.x - (t.width / 2), t.y);
+          // t.getLeftCenter(v, true);
+          this.slimePoints.push(v);
+        }
+      }
+      if (open.includes(Direction.east)) {
+        checkTile = this.getTileInDir(t, Direction.east);
+        if (!checkTile?.directionIsOpen(Direction.west)) {
+          const v = new Phaser.Math.Vector2(t.x + (t.width / 2), t.y);
+          // t.getRightCenter(v, true);
+          this.slimePoints.push(v);
+        }
+      }
+      if (open.includes(Direction.south)) {
+        checkTile = this.getTileInDir(t, Direction.south);
+        if (!checkTile?.directionIsOpen(Direction.north)) {
+          const v = new Phaser.Math.Vector2(t.x, t.y + (t.height / 2));
+          // t.getBottomCenter(v, true);
+          this.slimePoints.push(v);
+        }
+      }
+    });
+    this.slimePoints.forEach(v => {
+      v.x += this.container.x + (this.container.width / 2);
+      v.y += this.container.y + (this.container.height / 2);
+    });
   }
 }
